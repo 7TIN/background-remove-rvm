@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 import tempfile
 import shutil
+import time
 
 # ── Configuration ──────────────────────────────────────────────────────────
 RVM_REPO_URL = "https://github.com/PeterL1n/RobustVideoMatting.git"
@@ -35,32 +36,32 @@ _model = None
 def ensure_rvm_repo():
     """Clone RVM repo if not present."""
     if RVM_DIR.exists():
-        print(f"[RVM] Repo already exists at {RVM_DIR}")
+        print(f"[RVM] Repo already exists at {RVM_DIR}", flush=True)
         return
 
-    print(f"[RVM] Cloning repository...")
+    print(f"[RVM] Cloning repository...", flush=True)
     subprocess.run(
         ["git", "clone", "--depth", "1", RVM_REPO_URL, str(RVM_DIR)],
         check=True,
         capture_output=True,
     )
-    print(f"[RVM] Repo cloned.")
+    print(f"[RVM] Repo cloned.", flush=True)
 
 def ensure_model():
     """Download ResNet50 checkpoint if not present."""
     if MODEL_PATH.exists():
         size_mb = MODEL_PATH.stat().st_size / 1e6
-        print(f"[RVM] Model already exists: {MODEL_PATH} ({size_mb:.1f} MB)")
+        print(f"[RVM] Model already exists: {MODEL_PATH} ({size_mb:.1f} MB)", flush=True)
         return
 
-    print(f"[RVM] Downloading model...")
+    print(f"[RVM] Downloading model...", flush=True)
     subprocess.run(
         ["curl", "-L", "-o", str(MODEL_PATH), MODEL_URL],
         check=True,
         capture_output=True,
     )
     size_mb = MODEL_PATH.stat().st_size / 1e6
-    print(f"[RVM] Model downloaded: {size_mb:.1f} MB")
+    print(f"[RVM] Model downloaded: {size_mb:.1f} MB", flush=True)
 
 def patch_inference_utils():
     """Overwrite inference_utils.py with PyAV 12.x compatible version."""
@@ -106,7 +107,7 @@ class VideoWriter:
 """
     target = RVM_DIR / "inference_utils.py"
     target.write_text(patch)
-    print("[RVM] inference_utils.py patched for PyAV 12.x")
+    print("[RVM] inference_utils.py patched for PyAV 12.x", flush=True)
 
 def setup():
     """One-time setup: clone repo, download model, patch utils."""
@@ -127,9 +128,11 @@ def load_model():
     import torch
     from model import MattingNetwork
 
+    print(f"[RVM] Loading model on {device}...", flush=True)
+    t0 = time.time()
     _model = MattingNetwork(variant="resnet50").eval().to(device)
     _model.load_state_dict(torch.load(str(MODEL_PATH), map_location=device))
-    print(f"[RVM] Model loaded on {device}")
+    print(f"[RVM] Model loaded in {time.time()-t0:.1f}s", flush=True)
     return _model
 
 def get_video_info(path: str) -> Tuple[int, int, float, int]:
@@ -160,19 +163,6 @@ def process_video(
 ) -> str:
     """
     Process a video through RVM and output VP9 WebM with alpha (yuva420p).
-
-    Chrome/Remotion compatible — no ffmpeg post-processing needed.
-
-    Args:
-        input_path: Path to input video (any format ffmpeg can read)
-        output_path: Path for output .webm (VP9 with alpha)
-        downsample_ratio: Override auto-detected ratio (None = auto)
-        seq_chunk: Frames per batch (lower = better quality, slower)
-        crf: VP9 quality (0-63, lower = better, default 30 for speed/quality balance)
-        bitrate: Optional bitrate override (e.g. "2M", "5M")
-
-    Returns:
-        Absolute path to output file
     """
     import torch
     import av
@@ -188,47 +178,56 @@ def process_video(
 
     # Get video info
     W, H, FPS, TOTAL_FRAMES = get_video_info(str(input_path))
-    print(f"[RVM] Input: {W}x{H} @ {FPS:.3f}fps, {TOTAL_FRAMES} frames")
+    print(f"[RVM] Input: {W}x{H} @ {FPS:.3f}fps, {TOTAL_FRAMES} frames", flush=True)
 
     # Auto ratio
     if downsample_ratio is None:
         downsample_ratio = auto_downsample_ratio(W, H)
-    print(f"[RVM] downsample_ratio={downsample_ratio}, seq_chunk={seq_chunk}")
+    print(f"[RVM] downsample_ratio={downsample_ratio}, seq_chunk={seq_chunk}", flush=True)
 
     # Load model
     model = load_model()
 
     # Setup VP9 WebM writer with alpha
+    print("[RVM] Initializing VP9 encoder...", flush=True)
     out_webm = av.open(str(output_path), mode="w", format="webm")
     vs = out_webm.add_stream("libvpx-vp9", rate=Fraction(FPS).limit_denominator())
     vs.width = W
     vs.height = H
-    vs.pix_fmt = "yuva420p"           # Chrome-compatible alpha
+    vs.pix_fmt = "yuva420p"
 
     # VP9 options for alpha + quality
     options = {
-        "auto-alt-ref": "0",          # REQUIRED for alpha channel in VP9
+        "auto-alt-ref": "0",
         "crf": str(crf),
-        "b:v": bitrate or "0",        # 0 = VBR with CRF
-        "row-mt": "1",                # Multi-threading
-        "cpu-used": "4",              # Speed/quality tradeoff (0-8, higher = faster)
-        "deadline": "good",           # Encoding quality target
+        "row-mt": "1",
+        "cpu-used": "5",
+        "deadline": "good",
     }
     if bitrate:
         options["b:v"] = bitrate
-        options["crf"] = "0"          # Disable CRF when bitrate is set
+        options["crf"] = "0"
 
     vs.options = options
 
     # Process
+    print("[RVM] Reading video frames...", flush=True)
     reader = VideoReader(str(input_path), transform=None)
-    loader = DataLoader(reader, batch_size=seq_chunk, shuffle=False)
+    total_frames = len(reader)
+    print(f"[RVM] Total frames to process: {total_frames}", flush=True)
+
+    loader = DataLoader(reader, batch_size=seq_chunk, shuffle=False, num_workers=0)
 
     rec = [None] * 4
     frame_count = 0
+    chunk_count = 0
+    t_start = time.time()
 
     with torch.no_grad():
-        for batch in tqdm(loader, unit="chunk", desc="Matting"):
+        for batch in loader:
+            chunk_count += 1
+            t_chunk_start = time.time()
+
             src = batch.to(device).unsqueeze(0)
             fgr, pha, *rec = model(src, *rec, downsample_ratio=downsample_ratio)
 
@@ -239,7 +238,6 @@ def process_video(
                 rgb_u8 = (fgr[i].clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
                 alpha_u8 = (pha[i].clamp(0, 1) * 255).byte().squeeze(0).cpu().numpy()
 
-                # Build yuva420p frame directly
                 rgba_u8 = np.concatenate([rgb_u8, alpha_u8[..., None]], axis=2)
                 av_rgba = av.VideoFrame.from_ndarray(rgba_u8, format="rgba")
                 av_yuva = av_rgba.reformat(format="yuva420p")
@@ -249,19 +247,35 @@ def process_video(
 
                 frame_count += 1
 
+            # Progress log every chunk
+            elapsed = time.time() - t_start
+            fps = frame_count / elapsed if elapsed > 0 else 0
+            eta = (total_frames - frame_count) / fps if fps > 0 else 0
+            print(
+                f"[RVM] Chunk {chunk_count}: {frame_count}/{total_frames} frames | "
+                f"{fps:.1f} fps | ETA: {eta:.0f}s",
+                flush=True
+            )
+
     # Flush
+    print("[RVM] Finalizing encoder...", flush=True)
     for pkt in vs.encode():
         out_webm.mux(pkt)
     out_webm.close()
 
+    total_time = time.time() - t_start
     size_mb = output_path.stat().st_size / 1e6
-    print(f"[RVM] Done — {frame_count} frames → {output_path} ({size_mb:.1f} MB)")
+    print(
+        f"[RVM] Done — {frame_count} frames in {total_time:.1f}s "
+        f"({frame_count/total_time:.1f} fps) → {output_path} ({size_mb:.1f} MB)",
+        flush=True
+    )
     return str(output_path)
 
 def main() -> int:
     """CLI entrypoint."""
     if len(sys.argv) < 3:
-        print("Usage: python rvm_matting.py <input_video> <output_webm>")
+        print("Usage: python rvm_matting.py <input_video> <output_webm>", flush=True)
         return 1
 
     input_file = sys.argv[1]

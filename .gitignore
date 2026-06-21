@@ -26,9 +26,16 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .eslintcache
 .cache
 *.tsbuildinfo
-
+__pycache__/
 # IntelliJ based IDEs
 .idea
 
 # Finder (MacOS) folder config
 .DS_Store
+
+RobustVideoMatting
+rvm_resnet50.pth
+.venv
+
+storage
+video1.mp4
