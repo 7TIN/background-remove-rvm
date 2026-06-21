@@ -7,60 +7,39 @@ import path from "node:path";
 const app = new Hono();
 
 // ── Config ───────────────────────────────────────────────────────────────
-const PYTHON_BIN = process.env.PYTHON_BIN || path.resolve(process.cwd(), ".venv/Scripts/python.exe");
 const STORAGE_DIR = path.resolve(process.cwd(), "storage");
-const RVM_SCRIPT = path.resolve(process.cwd(), "rvm_matting.py");
-const MAX_BODY_SIZE = 512 * 1024 * 1024; // 512MB
-const PROCESS_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes max for CPU processing
+const MAX_BODY_SIZE = 512 * 1024 * 1024;
+const RVM_API_URL = process.env.RVM_API_URL?.replace(/\/$/, "");
 
-// ── Ensure storage dir exists ────────────────────────────────────────────
+if (!RVM_API_URL) {
+    console.error("❌ ERROR: RVM_API_URL env var not set!");
+    console.error("   Add to .env: RVM_API_URL=https://xxxx.ngrok-free.app");
+    process.exit(1);
+}
+
+console.log(`[config] Remote GPU server: ${RVM_API_URL}`);
+
 await mkdir(STORAGE_DIR, { recursive: true });
 
-// ── Validate Python environment (runs once at startup) ─────────────────
-async function validatePythonEnvironment() {
-    const proc = Bun.spawn(
-        [PYTHON_BIN, "-c", "import torch, av, numpy, tqdm; print('RVM deps OK')"],
-        { stdout: "pipe", stderr: "pipe" }
-    );
-    const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-    ]);
-    if (exitCode !== 0) {
-        throw new Error(`Python RVM environment invalid:\n${stderr || stdout}`);
-    }
-    console.log("[startup]", stdout.trim());
-}
-
-// ── Run one-time RVM setup (clone repo, download model) ────────────────
-async function setupRVM() {
-    console.log("[startup] Running RVM one-time setup...");
-    const proc = Bun.spawn(
-        [PYTHON_BIN, "-c", `
-import sys
-sys.path.insert(0, ".")
-from rvm_matting import setup
-setup()
-print("RVM setup complete")
-        `.trim()],
-        { stdout: "pipe", stderr: "pipe", cwd: process.cwd() }
-    );
-    const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-    ]);
-    if (exitCode !== 0) {
-        throw new Error(`RVM setup failed:\n${stderr || stdout}`);
-    }
-    console.log("[startup]", stdout.trim());
-}
-
 // ── Health check ─────────────────────────────────────────────────────────
-app.get("/", (c) => c.json({ message: "Clip Farm API", status: 200 }));
+app.get("/", (c) => c.json({
+    message: "Clip Farm API",
+    status: 200,
+    rvm_server: RVM_API_URL,
+}));
 
-// ── Upload + matting endpoint ────────────────────────────────────────────
+// ── GPU health proxy ─────────────────────────────────────────────────────
+app.get("/gpu-health", async (c) => {
+    try {
+        const res = await fetch(`${RVM_API_URL}/health`, { signal: AbortSignal.timeout(5000) });
+        const data = await res.json() as Record<string, unknown>;
+        return c.json({ ok: res.ok, ...data });
+    } catch (e: any) {
+        return c.json({ ok: false, error: e.message }, 502);
+    }
+});
+
+// ── Matting endpoint ──────────────────────────────────────────────────────
 app.post(
     "/matting",
     bodyLimit({
@@ -72,7 +51,7 @@ app.post(
         const jobId = crypto.randomUUID();
 
         try {
-            // Parse multipart upload
+            // ── Parse incoming file ──────────────────────────────────────
             const body = await c.req.parseBody();
             const file = body["video"];
 
@@ -80,174 +59,96 @@ app.post(
                 return c.json({ error: "Expected 'video' field with a file" }, 400);
             }
 
-            // Validate video type
-            const allowedTypes = ["video/mp4", "video/webm", "video/quicktime", "video/x-msvideo"];
-            if (!allowedTypes.includes(file.type)) {
-                return c.json({ error: `Unsupported video type: ${file.type}` }, 400);
+            const allowed = ["video/mp4", "video/webm", "video/quicktime", "video/x-msvideo"];
+            if (!allowed.includes(file.type)) {
+                return c.json({ error: `Unsupported type: ${file.type}` }, 400);
             }
 
-            const ext = path.extname(file.name) || ".mp4";
-            const inputPath = path.join(STORAGE_DIR, `${jobId}_input${ext}`);
-            const outputPath = path.join(STORAGE_DIR, `${jobId}_output.webm`);
+            const fileSizeMB = (file.size / 1024 / 1024).toFixed(2);
+            console.log(`\n[matting:${jobId}] ▶ START`);
+            console.log(`[matting:${jobId}] File: ${file.name} (${fileSizeMB} MB, ${file.type})`);
+            console.log(`[matting:${jobId}] Forwarding to GPU: ${RVM_API_URL}/matting`);
 
-            // Save uploaded file
-            const buffer = Buffer.from(await file.arrayBuffer());
-            await writeFile(inputPath, buffer);
-            console.log(`[matting:${jobId}] Saved input: ${inputPath} (${buffer.length} bytes)`);
+            // ── Build FormData correctly ──────────────────────────────────
+            // Re-create FormData with a proper File object so boundary is fresh.
+            // Do NOT re-use the parsed File directly — Bun can lose the boundary.
+            const fileBuffer = await file.arrayBuffer();
+            const freshFile = new File([fileBuffer], file.name, { type: file.type });
 
-            // ── Run RVM matting with REAL-TIME streaming logs ────────────
-            console.log(`[matting:${jobId}] Starting Python RVM process...`);
-            console.log(`[matting:${jobId}] WARNING: CPU processing is SLOW. First model load takes ~60s. A 5MB video takes ~5-15 min on CPU.`);
+            const formData = new FormData();
+            formData.append("video", freshFile);
 
-            const proc = Bun.spawn(
-                [PYTHON_BIN, RVM_SCRIPT, inputPath, outputPath],
-                {
-                    stdout: "pipe",
-                    stderr: "pipe",
-                    env: { 
-                        ...process.env, 
-                        PYTHONUNBUFFERED: "1",
-                        PYTHONIOENCODING: "utf-8",
-                    },
-                    cwd: process.cwd(),
-                }
-            );
+            // ── Heartbeat logger while we wait ────────────────────────────
+            const heartbeat = setInterval(() => {
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+                console.log(`[matting:${jobId}] ⏳ Still processing... ${elapsed}s elapsed`);
+            }, 10_000);
 
-            // Stream logs in REAL-TIME (don't wait for process to finish)
-            const stdoutChunks: string[] = [];
-            const stderrChunks: string[] = [];
+            // 10 minute timeout (CPU is very slow)
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 10 * 60 * 1000);
 
-            const stdoutPromise = (async () => {
-                const reader = proc.stdout.getReader();
-                const decoder = new TextDecoder();
-                try {
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        const text = decoder.decode(value, { stream: true });
-                        stdoutChunks.push(text);
-                        // Print immediately
-                        process.stdout.write(text);
-                    }
-                } catch (e) {
-                    // Stream closed
-                }
-            })();
+            console.log(`[matting:${jobId}] Request sent, waiting for GPU response...`);
 
-            const stderrPromise = (async () => {
-                const reader = proc.stderr.getReader();
-                const decoder = new TextDecoder();
-                try {
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        const text = decoder.decode(value, { stream: true });
-                        stderrChunks.push(text);
-                        // Print immediately to stderr
-                        process.stderr.write(text);
-                    }
-                } catch (e) {
-                    // Stream closed
-                }
-            })();
-
-            // Wait for process with timeout
-            const timeout = new Promise<never>((_, reject) => {
-                setTimeout(() => {
-                    try { proc.kill(); } catch {}
-                    reject(new Error(`Processing timed out after ${PROCESS_TIMEOUT_MS/60000} minutes`));
-                }, PROCESS_TIMEOUT_MS);
-            });
-
-            let exitCode: number;
+            let response: Response;
             try {
-                exitCode = await Promise.race([proc.exited, timeout]);
-            } catch (timeoutErr: any) {
-                await stdoutPromise.catch(() => {});
-                await stderrPromise.catch(() => {});
-                throw timeoutErr;
+                response = await fetch(`${RVM_API_URL}/matting`, {
+                    method: "POST",
+                    body: formData,
+                    signal: controller.signal,
+                    // Do NOT set Content-Type header — let fetch set it with the boundary
+                });
+            } finally {
+                clearTimeout(timeout);
+                clearInterval(heartbeat);
             }
 
-            // Wait for streams to finish draining
-            await stdoutPromise.catch(() => {});
-            await stderrPromise.catch(() => {});
+            if (!response.ok) {
+                const error = await response.text();
+                console.error(`[matting:${jobId}] ❌ GPU error ${response.status}: ${error}`);
+                return c.json({ error: "GPU failed", detail: error, status: response.status }, 500);
+            }
+
+            // ── Save result ───────────────────────────────────────────────
+            const outputPath = path.join(STORAGE_DIR, `${jobId}_output.webm`);
+            const buffer = Buffer.from(await response.arrayBuffer());
+            await writeFile(outputPath, buffer);
 
             const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-            const stdout = stdoutChunks.join("");
-            const stderr = stderrChunks.join("");
-
-            if (exitCode !== 0) {
-                console.error(`[matting:${jobId}] Failed after ${duration}s (exit ${exitCode})`);
-                await Bun.file(inputPath).delete().catch(() => {});
-                await Bun.file(outputPath).delete().catch(() => {});
-                return c.json(
-                    {
-                        error: "Matting processing failed",
-                        detail: stderr || stdout || "Unknown error",
-                        jobId,
-                        duration: `${duration}s`,
-                        exitCode,
-                    },
-                    500
-                );
-            }
-
-            console.log(`[matting:${jobId}] Success in ${duration}s`);
-
-            // Cleanup input file (keep output)
-            await Bun.file(inputPath).delete().catch(() => {});
-
-            // Check output exists
-            const outputExists = await Bun.file(outputPath).exists();
-            if (!outputExists) {
-                return c.json({ error: "Output file was not created", jobId }, 500);
-            }
-
-            const outputSize = (await Bun.file(outputPath).stat())?.size || 0;
+            console.log(`[matting:${jobId}] ✅ Done in ${duration}s — ${(buffer.length / 1024 / 1024).toFixed(2)} MB output`);
 
             return c.json({
                 success: true,
                 jobId,
-                input: { name: file.name, size: buffer.length, type: file.type },
+                input: { name: file.name, size: file.size, type: file.type },
                 output: {
-                    path: outputPath,
                     url: `/storage/${jobId}_output.webm`,
-                    size: outputSize,
+                    size: buffer.length,
                 },
                 duration: `${duration}s`,
             });
 
         } catch (err: any) {
             const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-            console.error(`[matting:${jobId}] Exception after ${duration}s:`, err);
-            return c.json(
-                {
-                    error: "Request processing failed",
-                    detail: err.message,
-                    jobId,
-                    duration: `${duration}s`,
-                },
-                500
-            );
+            if (err.name === "AbortError") {
+                console.error(`[matting:${jobId}] ❌ Timeout after ${duration}s`);
+                return c.json({ error: "GPU timed out (10 min limit)", jobId, duration: `${duration}s` }, 504);
+            }
+            console.error(`[matting:${jobId}] ❌ Failed after ${duration}s:`, err.message);
+            return c.json({ error: "Processing failed", detail: err.message, jobId, duration: `${duration}s` }, 500);
         }
     }
 );
 
-// ── Serve output files statically ────────────────────────────────────────
 app.use("/storage/*", serveStatic({ root: "." }));
 
-// ── Startup ──────────────────────────────────────────────────────────────
 const port = Number(process.env.PORT || 3001);
-
-await validatePythonEnvironment();
-await setupRVM();
-
 Bun.serve({
     fetch: app.fetch,
     port,
     maxRequestBodySize: MAX_BODY_SIZE,
 });
 
-console.log(`Clip Farm API running on http://localhost:${port}`);
-console.log(`NOTE: This server uses CPU for video matting. Processing is SLOW (~5-15 min for a 5MB video).`);
-console.log(`For production, use a GPU server or consider a lighter model.`);
+console.log(`\n✅ Server: http://localhost:${port}`);
+console.log(`🔗 GPU:    ${RVM_API_URL}`);
+console.log(`🩺 Check GPU health: http://localhost:${port}/gpu-health\n`);
