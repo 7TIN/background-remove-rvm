@@ -1,0 +1,7 @@
+# Python deps for RVM matting
+torch>=2.0
+torchvision
+av>=12.0
+tqdm
+numpy
+pillow
